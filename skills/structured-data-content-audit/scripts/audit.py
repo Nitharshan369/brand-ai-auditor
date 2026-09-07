@@ -13,12 +13,34 @@ import json
 import sys
 import re
 
+from urllib.parse import urlparse
+
 SKILL_NAME = "structured-data-content-audit"
 
 PRODUCT_URL_PATTERNS = ["/product", "/item", "/shop", "/store", "/buy", "/pricing", "/plan"]
 BLOG_URL_PATTERNS = ["/blog", "/article", "/news", "/post", "/insight"]
 GENERIC_SCHEMA_TYPES = {"Thing", "CreativeWork", "Intangible"}
-ORG_HOMEPAGE_TYPES = {"Organization", "WebSite", "LocalBusiness", "Corporation"}
+ORG_HOMEPAGE_TYPES = {
+    "Organization", "WebSite", "LocalBusiness", "Corporation",
+    "EducationalOrganization", "CollegeOrUniversity", "School",
+    "HighSchool", "NewsMediaOrganization", "GovernmentOrganization",
+    "NGO", "MedicalOrganization", "Event", "Project",
+    "Restaurant", "FoodEstablishment", "CafeOrCoffeeShop", "Bakery", "BarOrPub",
+    "Hospital", "MedicalClinic", "MedicalBusiness", "Physician",
+    "Hotel", "LodgingBusiness", "Store", "FinancialService", "AutomotiveBusiness"
+}
+
+
+def is_org_homepage_type(t: str) -> bool:
+    """Return True if type is Organization, WebSite, or any standard Organization/Entity subtype."""
+    if not isinstance(t, str):
+        return False
+    return (
+        t.endswith("Organization") or
+        t.endswith("Business") or
+        t.endswith("Establishment") or
+        t in ORG_HOMEPAGE_TYPES
+    )
 
 
 def parse_args():
@@ -34,8 +56,9 @@ def load_snapshot(path: str) -> dict:
 
 
 def url_matches(url: str, patterns: list) -> bool:
-    url_lower = url.lower()
-    return any(p in url_lower for p in patterns)
+    """Match pattern against URL path to avoid false positives on subdomains."""
+    path = urlparse(url).path.lower()
+    return any(p in path for p in patterns)
 
 
 def get_schema_types(json_ld_blocks: list) -> set:
@@ -121,8 +144,12 @@ def run_checks(snapshot: dict) -> tuple[list[dict], list[dict]]:
                 "category": "discoverability"
             })
 
-    # --- SDC-002: No JSON-LD on product pages ---
-    product_pages = [p for p in pages if url_matches(p["url"], PRODUCT_URL_PATTERNS)]
+    # --- SDC-002: No JSON-LD on product pages (Req 6, 23) ---
+    product_pages = [
+        p for p in pages
+        if p.get("page_type") in ("Product", "Service", "Pricing") or
+           (url_matches(p["url"], PRODUCT_URL_PATTERNS) and p.get("page_type") not in ("About", "Contact", "Careers", "Documentation", "Blog/article", "Homepage"))
+    ]
     if product_pages:
         product_pages_no_jsonld = [p for p in product_pages if not p.get("json_ld")]
         if product_pages_no_jsonld:
@@ -155,7 +182,8 @@ def run_checks(snapshot: dict) -> tuple[list[dict], list[dict]]:
     )
     if homepage:
         hp_types = get_schema_types(homepage.get("json_ld", []))
-        if not hp_types.intersection(ORG_HOMEPAGE_TYPES):
+        matched_org_types = [t for t in hp_types if is_org_homepage_type(t)]
+        if not matched_org_types:
             findings.append({
                 "check_id": "SDC-003",
                 "title": "Missing Organization or WebSite schema on homepage",
@@ -164,8 +192,8 @@ def run_checks(snapshot: dict) -> tuple[list[dict], list[dict]]:
                 "confidence": "high",
                 "affected_urls": [homepage["url"]],
                 "evidence": (
-                    f"Homepage ({homepage['url']}) has no JSON-LD with @type Organization, "
-                    f"WebSite, or LocalBusiness. Found types: {hp_types or 'none'}. "
+                    f"Homepage ({homepage['url']}) has no JSON-LD with an Organization, "
+                    f"WebSite, or brand entity type. Found types: {hp_types or 'none'}. "
                     "AI assistants cannot reliably identify and describe this brand."
                 ),
                 "tags": ["json-ld", "schema-org", "entity-identity"],
@@ -180,7 +208,7 @@ def run_checks(snapshot: dict) -> tuple[list[dict], list[dict]]:
             })
         else:
             strengths.append({
-                "title": f"Homepage has Organization/WebSite schema ({', '.join(hp_types & ORG_HOMEPAGE_TYPES)})",
+                "title": f"Homepage has Organization/WebSite schema ({', '.join(matched_org_types)})",
                 "category": "discoverability"
             })
 
@@ -477,6 +505,242 @@ def run_checks(snapshot: dict) -> tuple[list[dict], list[dict]]:
                 "summary": "Write unique, descriptive titles (40–60 characters) for every page.",
                 "priority": "medium",
                 "effort": "medium"
+            }
+        })
+
+    # --- SDC-013: Conflict between visible price and structured data price (Req 6, 12) ---
+    price_conflict_pages = []
+    price_pattern = re.compile(r'[\$€£]\s*(\d+(?:\.\d{2})?)|\b(\d+(?:\.\d{2})?)\s*(?:USD|EUR|GBP)\b', re.IGNORECASE)
+    for p in pages:
+        # Extract structured data price
+        ld_prices = []
+        for block in p.get("json_ld", []):
+            if isinstance(block, dict):
+                offers = block.get("offers")
+                if isinstance(offers, dict) and "price" in offers:
+                    try:
+                        ld_prices.append(float(str(offers["price"]).replace(",", "")))
+                    except ValueError:
+                        pass
+                elif isinstance(offers, list):
+                    for off in offers:
+                        if isinstance(off, dict) and "price" in off:
+                            try:
+                                ld_prices.append(float(str(off["price"]).replace(",", "")))
+                            except ValueError:
+                                pass
+        if not ld_prices:
+            continue
+
+        # Extract visible prices
+        visible_text = p.get("visible_text_sample", "")
+        matches = price_pattern.findall(visible_text)
+        visible_prices = []
+        for m in matches:
+            val_str = m[0] or m[1]
+            try:
+                visible_prices.append(float(val_str))
+            except ValueError:
+                pass
+
+        if visible_prices and ld_prices:
+            if not any(abs(vp - lp) < 0.01 for vp in visible_prices for lp in ld_prices):
+                price_conflict_pages.append((p, visible_prices[0], ld_prices[0]))
+
+    if price_conflict_pages:
+        findings.append({
+            "check_id": "SDC-013",
+            "title": f"Visible price conflicts with structured data price on {len(price_conflict_pages)} page(s)",
+            "category": "discoverability",
+            "severity": "high",
+            "confidence": "high",
+            "affected_urls": [p[0]["url"] for p in price_conflict_pages[:5]],
+            "evidence": (
+                f"Page {price_conflict_pages[0][0]['url']} displays visible price ${price_conflict_pages[0][1]} "
+                f"but JSON-LD schema declares ${price_conflict_pages[0][2]}. "
+                "Conflicting facts cause AI agents to hallucinate or distrust pricing data."
+            ),
+            "tags": ["json-ld", "price-conflict", "contradiction", "structured-data"],
+            "suggested_action": {
+                "summary": "Synchronize visible pricing numbers with JSON-LD schema offers.",
+                "priority": "high",
+                "effort": "low"
+            }
+        })
+
+    # --- SDC-206: Boilerplate or placeholder page titles ---
+    boilerplate_names = {"home", "untitled", "default title", "new page", "website", "index", "page 1", "document", "coming soon"}
+    boilerplate_pages = []
+    for p in pages:
+        t = (p.get("title") or "").strip().lower()
+        if t in boilerplate_names or t.startswith("untitled") or t.startswith("default title"):
+            boilerplate_pages.append(p)
+    if boilerplate_pages:
+        sample_bp = [f"{p['url']} (title: \"{p.get('title')}\")" for p in boilerplate_pages[:3]]
+        findings.append({
+            "check_id": "SDC-206",
+            "title": f"Boilerplate or generic page title on {len(boilerplate_pages)} page(s)",
+            "category": "discoverability",
+            "severity": "medium",
+            "confidence": "high",
+            "affected_urls": [p["url"] for p in boilerplate_pages[:5]],
+            "evidence": (
+                f"{len(boilerplate_pages)} page(s) use placeholder or boilerplate titles: "
+                f"{', '.join(sample_bp)}. "
+                "Generic titles prevent AI assistants from indexing distinct page topics."
+            ),
+            "tags": ["page-title", "heading-structure"],
+            "suggested_action": {
+                "summary": "Replace generic titles with distinct, descriptive titles containing brand and topic keywords.",
+                "priority": "medium",
+                "effort": "low"
+            }
+        })
+
+    # --- SDC-207: Missing H1 on core inferred content pages ---
+    core_content_types = {"Product", "Service", "Documentation", "Article", "About"}
+    content_pages_no_h1 = [
+        p for p in pages
+        if p.get("page_type") in core_content_types and
+        p["url"] != start_url and
+        len(p.get("h1", [])) == 0 and
+        p.get("visible_text_length", 0) >= 200
+    ]
+    if content_pages_no_h1:
+        sample_h1 = [f"{p['url']} (type: {p.get('page_type')})" for p in content_pages_no_h1[:3]]
+        findings.append({
+            "check_id": "SDC-207",
+            "title": f"Missing H1 heading on {len(content_pages_no_h1)} core content page(s)",
+            "category": "discoverability",
+            "severity": "medium",
+            "confidence": "high",
+            "affected_urls": [p["url"] for p in content_pages_no_h1[:5]],
+            "evidence": (
+                f"{len(content_pages_no_h1)} content page(s) lack an <h1> heading: "
+                f"{', '.join(sample_h1)}. "
+                "The H1 heading is the primary topic signal for AI content extraction."
+            ),
+            "tags": ["heading-structure", "h1-tag"],
+            "suggested_action": {
+                "summary": "Add a descriptive <h1> heading identifying the core topic or entity on each content page.",
+                "priority": "medium",
+                "effort": "low"
+            }
+        })
+
+    # --- SDC-208: Incomplete core Schema.org entity declarations ---
+    incomplete_schema_pages = []
+    for p in pages:
+        for block in p.get("json_ld", []):
+            if not isinstance(block, dict):
+                continue
+            nodes = [block] + (block.get("@graph", []) if isinstance(block.get("@graph"), list) else [])
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                nt = node.get("@type", "")
+                nt_types = [nt] if isinstance(nt, str) else (nt if isinstance(nt, list) else [])
+                # Organization
+                if any(is_org_homepage_type(t) for t in nt_types):
+                    if not node.get("name") and not node.get("legalName"):
+                        incomplete_schema_pages.append((p, "Organization missing 'name'", node))
+                        break
+                # Product
+                elif any("Product" in t for t in nt_types):
+                    if not node.get("name"):
+                        incomplete_schema_pages.append((p, "Product missing 'name'", node))
+                        break
+                    elif not node.get("offers") and not node.get("description"):
+                        incomplete_schema_pages.append((p, "Product missing 'offers' or 'description'", node))
+                        break
+                # Article / BlogPosting
+                elif any(t in ("Article", "BlogPosting", "NewsArticle") for t in nt_types):
+                    if not node.get("headline"):
+                        incomplete_schema_pages.append((p, "Article missing 'headline'", node))
+                        break
+                    elif not node.get("datePublished") and not node.get("dateModified"):
+                        incomplete_schema_pages.append((p, "Article missing 'datePublished'", node))
+                        break
+
+    if incomplete_schema_pages:
+        distinct_incomplete = list({item[0]["url"]: item for item in incomplete_schema_pages}.values())
+        sample_incomplete = [f"{item[0]['url']} ({item[1]})" for item in distinct_incomplete[:3]]
+        findings.append({
+            "check_id": "SDC-208",
+            "title": f"Incomplete Schema.org entity declarations on {len(distinct_incomplete)} page(s)",
+            "category": "discoverability",
+            "severity": "medium",
+            "confidence": "high",
+            "affected_urls": [item[0]["url"] for item in distinct_incomplete[:5]],
+            "evidence": (
+                f"{len(distinct_incomplete)} page(s) define Schema.org objects missing required properties: "
+                f"{', '.join(sample_incomplete)}. "
+                "Incomplete schema blocks prevent AI agents from fully structuring brand entities."
+            ),
+            "tags": ["json-ld", "schema-org", "structured-data"],
+            "suggested_action": {
+                "summary": "Populate essential schema properties (name, headline, offers, datePublished) for all declared types.",
+                "priority": "medium",
+                "effort": "low"
+            }
+        })
+
+    # --- SDC-209: Semantic contradiction between Schema and visible heading ---
+    # Guardrail: No rigid '0 word overlap' rule. Tokenize and normalize semantic entities.
+    def extract_semantic_tokens(text: str) -> set[str]:
+        stopwords = {"the", "and", "for", "with", "this", "that", "from", "our", "all", "your", "page", "home"}
+        words = re.findall(r'[a-zA-Z]{3,}', text.lower())
+        return {w for w in words if w not in stopwords}
+
+    schema_conflicts = []
+    for p in pages:
+        h1_text = " ".join(p.get("h1", []))
+        title_text = p.get("title", "")
+        visible_tokens = extract_semantic_tokens(h1_text + " " + title_text)
+        if not visible_tokens:
+            continue
+
+        for block in p.get("json_ld", []):
+            if not isinstance(block, dict):
+                continue
+            nodes = [block] + (block.get("@graph", []) if isinstance(block.get("@graph"), list) else [])
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                schema_name = node.get("name") or node.get("headline")
+                if isinstance(schema_name, str) and len(schema_name.strip()) > 5:
+                    schema_tokens = extract_semantic_tokens(schema_name)
+                    # Only flag if schema_tokens has at least 2 distinct semantic tokens
+                    # and none of them appear in visible tokens or visible text sample
+                    if len(schema_tokens) >= 2:
+                        overlap = schema_tokens & visible_tokens
+                        sample_lower = p.get("visible_text_sample", "").lower()
+                        in_sample = any(tok in sample_lower for tok in schema_tokens)
+                        if not overlap and not in_sample:
+                            schema_conflicts.append((p, schema_name, h1_text or title_text))
+                            break
+
+    if schema_conflicts:
+        distinct_conflicts = list({item[0]["url"]: item for item in schema_conflicts}.values())
+        target_item = distinct_conflicts[0]
+        findings.append({
+            "check_id": "SDC-209",
+            "title": f"Semantic contradiction between Schema.org and visible headings on {len(distinct_conflicts)} page(s)",
+            "category": "discoverability",
+            "severity": "medium",
+            "confidence": "high",
+            "affected_urls": [item[0]["url"] for item in distinct_conflicts[:5]],
+            "evidence": (
+                f"Declared Schema.org entity name/headline contradicts visible page headings: "
+                f"Page {target_item[0]['url']} declares schema entity '{target_item[1]}' "
+                f"while visible heading is '{target_item[2]}'. "
+                "Contradictory entity facts cause AI models to discount site reliability."
+            ),
+            "tags": ["schema-org", "trust", "contradiction", "structured-data"],
+            "suggested_action": {
+                "summary": "Ensure Schema.org entity names and headlines correspond to the actual on-page title and headings.",
+                "priority": "medium",
+                "effort": "low"
             }
         })
 
